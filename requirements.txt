@@ -1,0 +1,26 @@
+# --- Lista de Requirements para o Sistema de Controle de Acesso Facial ---
+# Versões estáveis e compatíveis testadas para este projeto.
+
+# Para captura e manipulação de imagem da câmera
+opencv-python==4.9.0.80
+
+# O cérebro do reconhecimento facial
+insightface==0.7.3
+    
+# O motor que executa os modelos de IA do insightface (versão para CPU)
+onnxruntime==1.17.3
+
+# Essencial para cálculos numéricos com imagens e vetores (versão anterior à 2.0 para máxima compatibilidade)
+numpy==1.26.4
+
+# Para a busca ultra-rápida de similaridade entre as faces (versão para CPU)
+faiss-cpu==1.8.0
+
+# Para integrar as imagens do OpenCV com a interface gráfica Tkinter
+Pillow==10.3.0
+
+# Para a comunicação com o banco de dados MySQL
+mysql-connector-python==8.4.0
+
+# Para gerar o arquivo .exe final
+pyinstaller==6.8.0

@@ -1,0 +1,317 @@
+import cv2
+import tkinter as tk
+from tkinter import messagebox, ttk
+import time
+import insightface
+import numpy as np
+import threading
+from PIL import Image, ImageTk
+import os
+import faiss
+import sys
+from enum import Enum
+from datetime import datetime
+import mysql.connector
+from mysql.connector import Error
+import subprocess
+from dotenv import load_dotenv
+
+load_dotenv()
+
+def get_base_path():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    else:
+        return os.path.dirname(os.path.abspath(__file__))
+    
+class RecognitionState(Enum):
+    AWAITING = 1
+    PROCESSING = 2
+    SHOWING_RESULT = 3
+
+class FaceAccessControl:
+    THRESHOLD = 0.4
+    PROCESSING_TIME_SECONDS = 2
+
+    def __init__(self, root):
+        self.root = root
+        
+        # --- [ ÁREA DE CONFIGURAÇÃO DO BANCO ] ---
+        self.db_config = {
+            'host': os.getenv("DB_HOST"),
+            'user': os.getenv("DB_USER"),
+            'password': os.getenv("DB_PASSWORD"),
+            'database': os.getenv("DB_NAME")
+        }
+        self.db_table    = "move"
+        self.db_col_nome = "mat"
+        self.db_col_maq  = "maq"
+        # -----------------------------------------
+
+        self.root.title("Controle de Acesso - Entrada e Saída")
+        self.root.geometry("1000x600")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        self.model = None
+        self.faiss_index = None
+        self.known_names = []
+        self.gallery_path = "galeria"
+        self.cache_path = "embeddings_cache"
+        os.makedirs(self.gallery_path, exist_ok=True)
+        os.makedirs(self.cache_path, exist_ok=True)
+        
+        self.create_widgets()
+        
+        # --- [ CONFIGURAÇÃO DAS CÂMERAS ] ---
+        # Aqui nós criamos "cérebros" separados para cada câmera
+        self.cameras = {
+            "entrada": {
+                "id": 0,                 # ID da câmera USB de Entrada (Mude se necessário)
+                "modo": 0,               # 0 = Entrada no Banco
+                "rota": "/entrada/abrir",# Rota do Arduino
+                "cap": None,
+                "label": self.video_label_entrada,
+                "status_label": self.status_entrada,
+                "state": RecognitionState.AWAITING,
+                "start_time": None,
+                "best_area": 0,
+                "best_emb": None
+            },
+            "saida": {
+                "id": 1,                 # ID da câmera USB de Saída (Mude se necessário)
+                "modo": 1,               # 1 = Saída no Banco
+                "rota": "/saida/abrir",  # Rota do Arduino
+                "cap": None,
+                "label": self.video_label_saida,
+                "status_label": self.status_saida,
+                "state": RecognitionState.AWAITING,
+                "start_time": None,
+                "best_area": 0,
+                "best_emb": None
+            }
+        }
+        
+        threading.Thread(target=self.init_model, daemon=True).start()
+
+    def create_widgets(self):
+        main_frame = tk.Frame(self.root)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Frame para acomodar os dois vídeos lado a lado
+        videos_frame = tk.Frame(main_frame)
+        videos_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # UI da Câmera de Entrada (Esquerda)
+        entrada_frame = tk.Frame(videos_frame, bd=2, relief=tk.GROOVE)
+        entrada_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
+        lbl_titulo_ent = tk.Label(entrada_frame, text="ENTRADA", font=("Arial", 14, "bold"))
+        lbl_titulo_ent.pack(pady=5)
+        self.video_label_entrada = tk.Label(entrada_frame)
+        self.video_label_entrada.pack(fill=tk.BOTH, expand=True)
+        self.status_entrada = tk.Label(entrada_frame, text="Aguardando inicialização...", font=("Arial", 12))
+        self.status_entrada.pack(pady=10)
+
+        # UI da Câmera de Saída (Direita)
+        saida_frame = tk.Frame(videos_frame, bd=2, relief=tk.GROOVE)
+        saida_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5)
+        lbl_titulo_sai = tk.Label(saida_frame, text="SAÍDA", font=("Arial", 14, "bold"))
+        lbl_titulo_sai.pack(pady=5)
+        self.video_label_saida = tk.Label(saida_frame)
+        self.video_label_saida.pack(fill=tk.BOTH, expand=True)
+        self.status_saida = tk.Label(saida_frame, text="Aguardando inicialização...", font=("Arial", 12))
+        self.status_saida.pack(pady=10)
+
+        # Controles inferiores
+        control_frame = tk.Frame(main_frame)
+        control_frame.pack(fill=tk.X, pady=10)
+        self.update_button = ttk.Button(control_frame, text="Atualizar Galeria", command=self.update_gallery)
+        self.update_button.pack(side=tk.LEFT, padx=5)
+        self.progress = ttk.Progressbar(control_frame, mode='determinate')
+        self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self.quit_button = ttk.Button(control_frame, text="Encerrar", command=self.on_closing)
+        self.quit_button.pack(side=tk.RIGHT, padx=5)
+
+    def init_model(self):
+        try:
+            base_path = get_base_path()
+            self.model = insightface.app.FaceAnalysis(name="buffalo_l", root=base_path)
+            self.model.prepare(ctx_id=1)
+            self.root.after(0, self.load_gallery)
+        except Exception as e:
+            print(f"Erro real:", e) 
+            messagebox.showerror("Erro", f"Falha ao inicializar o modelo:\n{e}")
+            self.on_closing()
+
+    def registrar_no_banco(self, match_name, modo_operacao):
+        query = f"INSERT INTO {self.db_table} ({self.db_col_nome}, {self.db_col_maq}) VALUES (%s, %s)"
+        args = (match_name, modo_operacao)
+        connection = None
+        try:
+            connection = mysql.connector.connect(**self.db_config)
+            cursor = connection.cursor()
+            cursor.execute(query, args)
+            connection.commit()
+            tipo = "Entrada" if modo_operacao == 0 else "Saída"
+            print(f"Registro inserido: {match_name} ({tipo})")
+        except Error as e:
+            print(f"Erro ao conectar ou inserir no MySQL: {e}")
+        finally:
+            if connection and connection.is_connected():
+                cursor.close()
+                connection.close()
+
+    def abrir_catraca(self, rota):
+        ip_da_catraca = "192.168.4.1"
+        try:
+            comando = ["curl", "-s", f"http://{ip_da_catraca}{rota}"]
+            subprocess.Popen(comando)   
+            print(f"Sinal enviado para a catraca via: {rota}")
+        except Exception as e:
+            print(f"Erro ao tentar acionar a catraca ({rota}): {e}")
+
+    def load_gallery(self):
+        self.status_entrada.config(text="Carregando galeria...")
+        self.status_saida.config(text="Carregando galeria...")
+        threading.Thread(target=self._process_gallery, args=(False,), daemon=True).start()
+
+    def update_gallery(self):
+        self.update_button.config(state=tk.DISABLED)
+        threading.Thread(target=self._process_gallery, args=(True,), daemon=True).start()
+
+    def _process_gallery(self, only_new):
+        files = [f for f in os.listdir(self.gallery_path) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        if only_new:
+            files = [f for f in files if not os.path.exists(os.path.join(self.cache_path, f"{os.path.splitext(f)[0]}.npy"))]
+        if not files and only_new:
+            self.root.after(0, self._gallery_updated)
+            return
+        embeddings, names = [], []
+        if not only_new:
+            for f in [f for f in os.listdir(self.gallery_path) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]:
+                name, cache = os.path.splitext(f)[0], os.path.join(self.cache_path, f"{os.path.splitext(f)[0]}.npy")
+                if os.path.exists(cache):
+                    embeddings.append(np.load(cache)); names.append(name)
+        self.progress['maximum'] = len(files)
+        for i, f in enumerate(files):
+            name, cache = os.path.splitext(f)[0], os.path.join(self.cache_path, f"{name}.npy")
+            img = cv2.imread(os.path.join(self.gallery_path, f))
+            if img is None: continue
+            faces = self.model.get(img)
+            if not faces: continue
+            emb = faces[0].embedding
+            np.save(cache, emb); embeddings.append(emb); names.append(name)
+            self.progress['value'] = i + 1; self.root.update_idletasks()
+        if embeddings:
+            emb_np = np.array(embeddings).astype('float32')
+            faiss.normalize_L2(emb_np)
+            self.faiss_index = faiss.IndexFlatIP(emb_np.shape[1])
+            self.faiss_index.add(emb_np)
+            self.known_names = names
+        self.root.after(0, self._gallery_updated)
+
+    def _gallery_updated(self):
+        self.progress['value'] = 0
+        txt = f"Pronto. ({self.faiss_index.ntotal if self.faiss_index else 0} faces)"
+        self.status_entrada.config(text=txt, fg="black")
+        self.status_saida.config(text=txt, fg="black")
+        self.update_button.config(state=tk.NORMAL)
+        self.start_cameras()
+
+    def start_cameras(self):
+        # Abre as duas câmeras baseadas no ID do dicionário
+        for cam_name, cam_data in self.cameras.items():
+            cam_data["cap"] = cv2.VideoCapture(cam_data["id"])
+            if not cam_data["cap"].isOpened():
+                messagebox.showwarning("Aviso", f"Não foi possível abrir a câmera de {cam_name.upper()} (ID {cam_data['id']}).")
+        
+        self.update_frame()
+
+    def update_frame(self):
+        # Faz o loop pelas duas câmeras independentemente
+        for cam_name, cam in self.cameras.items():
+            if not cam["cap"] or not cam["cap"].isOpened():
+                continue
+                
+            ret, frame = cam["cap"].read()
+            if ret:
+                # Diminuir a resolução ajuda no desempenho com 2 câmeras
+                frame = cv2.resize(frame, (480, 360)) 
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                processed_frame = rgb.copy()
+                
+                if self.faiss_index and self.faiss_index.ntotal > 0 and cam["state"] != RecognitionState.SHOWING_RESULT:
+                    faces = self.model.get(frame)
+                    if faces:
+                        main_face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+                        bbox = main_face.bbox.astype(int)
+                        cv2.rectangle(processed_frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 0), 2)
+                        
+                        if cam["state"] == RecognitionState.AWAITING:
+                            cam["state"] = RecognitionState.PROCESSING
+                            cam["start_time"] = time.time()
+                            cam["best_area"] = 0
+                            cam["best_emb"] = None
+                            cam["status_label"].config(text="Analisando face...", fg="blue")
+                            
+                        if cam["state"] == RecognitionState.PROCESSING:
+                            face_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+                            if face_area > cam["best_area"]:
+                                cam["best_area"] = face_area
+                                cam["best_emb"] = main_face.embedding
+                                
+                            if time.time() - cam["start_time"] >= self.PROCESSING_TIME_SECONDS:
+                                self.process_best_shot(cam_name)
+                    elif cam["state"] == RecognitionState.PROCESSING: 
+                        self.reset_state(cam_name)
+                
+                pil_img = Image.fromarray(processed_frame)
+                imgtk = ImageTk.PhotoImage(image=pil_img)
+                cam["label"].imgtk = imgtk
+                cam["label"].config(image=imgtk)
+
+        # Roda o loop contínuo
+        self.root.after(30, self.update_frame)
+
+    def process_best_shot(self, cam_name):
+        cam = self.cameras[cam_name]
+        cam["state"] = RecognitionState.SHOWING_RESULT
+        
+        if cam["best_emb"] is not None:
+            emb = cam["best_emb"].reshape(1, -1).astype('float32')
+            faiss.normalize_L2(emb)
+            D, I = self.faiss_index.search(emb, 1)
+            
+            if D[0][0] >= self.THRESHOLD:
+                match_name = self.known_names[I[0][0]]
+                cam["status_label"].config(text=f"Acesso Liberado: {match_name}", fg="green")
+                
+                # Executa as ações usando os dados específicos dessa câmera
+                self.registrar_no_banco(match_name, cam["modo"])
+                self.abrir_catraca(cam["rota"])
+                
+                # Reseta a câmera específica após 2 segundos
+                self.root.after(2000, lambda: self.reset_state(cam_name))
+            else:
+                cam["status_label"].config(text="Acesso Negado (Desconhecido)", fg="red")
+                self.root.after(2000, lambda: self.reset_state(cam_name))
+        else: 
+            self.reset_state(cam_name)
+    
+    def reset_state(self, cam_name):
+        cam = self.cameras[cam_name]
+        cam["state"] = RecognitionState.AWAITING
+        cam["start_time"] = None
+        cam["best_area"] = 0
+        cam["best_emb"] = None
+        cam["status_label"].config(text="Aguardando face...", fg="black")
+
+    def on_closing(self):
+        for cam in self.cameras.values():
+            if cam["cap"]:
+                cam["cap"].release()
+        self.root.destroy()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = FaceAccessControl(root)
+    root.mainloop()
